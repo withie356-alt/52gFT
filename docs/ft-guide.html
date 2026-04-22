@@ -1286,10 +1286,17 @@
   const state = loadState();
   state.days = state.days || {};
 
-  // 펼치기 직전 스크롤 위치 (접을 때 복원용)
-  const preOpenScroll = {};
-  // 초기화 중에는 toggle 이벤트의 스크롤/저장을 건너뜀
+  // 초기화 중에는 toggle 이벤트의 저장을 건너뜀
   let suppressToggle = true;
+
+  // 카드 상단이 스티키 헤더 바로 아래로 오도록 스크롤
+  function scrollCardIntoView(card){
+    const header = document.querySelector('.hdr');
+    const headerH = header ? header.offsetHeight : 100;
+    const rect = card.getBoundingClientRect();
+    const targetY = rect.top + window.scrollY - headerH - 6;
+    window.scrollTo({ top: Math.max(0, targetY), behavior: 'smooth' });
+  }
 
   function restoreCardPosition(card, stack){
     const origIdx = parseInt(card.dataset.originalIndex, 10);
@@ -1365,30 +1372,16 @@
           if (suppressToggle) return;
           const st = state.days[dayKey];
           st.open = st.open || [];
-
+          const idx = st.open.indexOf(id);
           if (details.open){
-            // 펼칠 때: 현재 스크롤 저장 → 다른 항목 접기(아코디언) → 해당 카드로 스크롤
-            preOpenScroll[id] = window.scrollY;
-            // 같은 day 내 다른 details 닫기
-            suppressToggle = true;
-            stack.querySelectorAll('details[open]').forEach(other => {
-              if (other !== details) other.open = false;
-            });
-            suppressToggle = false;
-            st.open = [id];
+            if (idx === -1) st.open.push(id);
             st.last = id;
-            // 스티키 헤더 아래에 카드 상단 정렬
+            // 펼침 + reflow 끝난 뒤 카드 상단이 스티키 헤더 바로 아래로 오도록 스크롤
             requestAnimationFrame(() => {
-              card.scrollIntoView({ block: 'start', behavior: 'smooth' });
+              requestAnimationFrame(() => scrollCardIntoView(card));
             });
           } else {
-            // 접을 때: 이전 스크롤로 복귀
-            st.open = st.open.filter(x => x !== id);
-            const prev = preOpenScroll[id];
-            if (typeof prev === 'number'){
-              window.scrollTo({ top: prev, behavior: 'smooth' });
-              delete preOpenScroll[id];
-            }
+            if (idx !== -1) st.open.splice(idx, 1);
           }
           saveState(state);
         });
@@ -1403,18 +1396,14 @@
         stack.appendChild(card);
       }
     });
-    // 열린 항목 복원 (아코디언이므로 최대 1개만 유지)
-    const openId = dState.open[dState.open.length - 1];
-    if (openId){
-      const card = stack.querySelector('[data-id="'+openId+'"]');
-      if (card){
-        const d = card.querySelector('details');
-        if (d) d.open = true;
-        dState.open = [openId];
-      } else {
-        dState.open = [];
-      }
-    }
+    // 열린 항목 복원 (여러 개 가능)
+    dState.open = (dState.open || []).filter(id => {
+      const card = stack.querySelector('[data-id="'+id+'"]');
+      if (!card) return false;
+      const d = card.querySelector('details');
+      if (d) d.open = true;
+      return true;
+    });
   });
 
   // 탭 전환
@@ -1504,6 +1493,50 @@
   let tmEndAt = 0;
   let tmRaf = null;
   let tmFinished = false;
+  let tmWakeLock = null;
+
+  async function tmAcquireWakeLock(){
+    if (!('wakeLock' in navigator)) return;
+    try {
+      tmWakeLock = await navigator.wakeLock.request('screen');
+      tmWakeLock.addEventListener('release', () => { tmWakeLock = null; });
+    } catch(e){}
+  }
+  function tmReleaseWakeLock(){
+    if (tmWakeLock){
+      try { tmWakeLock.release(); } catch(e){}
+      tmWakeLock = null;
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && tmRunning && !tmWakeLock){
+      tmAcquireWakeLock();
+    }
+  });
+
+  async function tmEnsureNotifPermission(){
+    if (!('Notification' in window)) return false;
+    if (Notification.permission === 'granted') return true;
+    if (Notification.permission === 'denied') return false;
+    try {
+      const p = await Notification.requestPermission();
+      return p === 'granted';
+    } catch(e){ return false; }
+  }
+
+  function tmNotify(){
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    try {
+      const n = new Notification('⏰ 타이머 종료', {
+        body: '설정한 시간이 끝났습니다',
+        vibrate: state.vibrateOn !== false ? [200, 100, 200, 100, 200] : undefined,
+        silent: state.soundOn === false,
+        tag: 'ft-timer',
+        requireInteraction: false
+      });
+      setTimeout(() => { try { n.close(); } catch(e){} }, 8000);
+    } catch(e){}
+  }
 
   function fmt(ms){
     const s = Math.max(0, Math.ceil(ms / 1000));
@@ -1550,8 +1583,10 @@
       tmRunning = false;
       tmFinished = true;
       if (tmRaf){ cancelAnimationFrame(tmRaf); tmRaf = null; }
+      tmReleaseWakeLock();
       updateTimerUI();
       tmBeep();
+      tmNotify();
       return;
     }
     tmRaf = requestAnimationFrame(tmTick);
@@ -1563,12 +1598,15 @@
     tmRunning = true;
     tmFinished = false;
     tmEndAt = Date.now() + tmRemaining;
+    tmAcquireWakeLock();
+    tmEnsureNotifPermission();
     tmTick();
   }
   function tmPause(){
     if (!tmRunning) return;
     tmRunning = false;
     if (tmRaf){ cancelAnimationFrame(tmRaf); tmRaf = null; }
+    tmReleaseWakeLock();
     updateTimerUI();
   }
   function tmReset(ms){
@@ -1662,14 +1700,20 @@
     state.soundOn = !state.soundOn;
     applyAlertToggles();
     saveState(state);
-    if (state.soundOn) tmPreviewBeep();
+    if (state.soundOn){
+      tmPreviewBeep();
+      tmEnsureNotifPermission();
+    }
   });
   tmVibBtn.addEventListener('click', () => {
     state.vibrateOn = !state.vibrateOn;
     applyAlertToggles();
     saveState(state);
-    if (state.vibrateOn && navigator.vibrate){
-      try { navigator.vibrate(150); } catch(e){}
+    if (state.vibrateOn){
+      if (navigator.vibrate){
+        try { navigator.vibrate(150); } catch(e){}
+      }
+      tmEnsureNotifPermission();
     }
   });
   document.addEventListener('keydown', (e) => {
